@@ -160,7 +160,10 @@ def build_video():
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"ERROR: {error_detail}")
+        return jsonify({"error": str(e), "detail": error_detail}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
