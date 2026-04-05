@@ -1,0 +1,7 @@
+flask
+requests
+moviepy==1.0.3
+Pillow
+numpy
+cloudinary
+gunicorn
