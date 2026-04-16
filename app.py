@@ -11,8 +11,6 @@ from flask import Flask, request, jsonify
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
-check_auth()
-
 AUTH_TOKEN = os.environ.get("API_SECRET_TOKEN")
 
 def check_auth():
@@ -226,6 +224,7 @@ def health():
 
 @app.route("/build", methods=["POST"])
 def build():
+    check_auth()
     """
     Build a short-form video.
 
