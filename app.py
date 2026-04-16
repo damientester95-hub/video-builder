@@ -10,24 +10,19 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────────────
 AUTH_TOKEN = os.environ.get("API_SECRET_TOKEN")
 
 def check_auth():
-
     if not AUTH_TOKEN:
-
         return  # no auth configured, allow all
-
     token = request.headers.get("X-Api-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
-
     if token != AUTH_TOKEN:
-
         from flask import abort
-
         abort(403)
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -36,24 +31,23 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Config ───────────────────────────────────────────────────────────────────
-CLOUDINARY_UPLOAD_URL = os.environ.get("CLOUDINARY_UPLOAD_URL")   # e.g. https://api.cloudinary.com/v1_1/<cloud>/video/upload
+# ── Config ────────────────────────────────────────────────────────────────────
 CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 
-# How long each photo scene lasts (seconds).  Override via request body.
 DEFAULT_SCENE_DURATION = 5
 
+FFMPEG  = "/root/.nix-profile/bin/ffmpeg"
+FFPROBE = "/root/.nix-profile/bin/ffprobe"
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def run(cmd: list[str], cwd=None) -> subprocess.CompletedProcess:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def run(cmd: list, cwd=None) -> subprocess.CompletedProcess:
     """Run a shell command, log it, raise on non-zero exit."""
     log.info("RUN: %s", " ".join(cmd))
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=cwd
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.stdout:
         log.info("STDOUT: %s", result.stdout[-2000:])
     if result.stderr:
@@ -69,7 +63,7 @@ def run(cmd: list[str], cwd=None) -> subprocess.CompletedProcess:
 
 def download_file(url: str, dest: Path) -> Path:
     """Stream-download a URL to dest path."""
-    log.info("Downloading %s → %s", url, dest)
+    log.info("Downloading %s -> %s", url, dest)
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
@@ -81,7 +75,8 @@ def download_file(url: str, dest: Path) -> Path:
 
 def upload_to_cloudinary(file_path: Path) -> str:
     """Upload a file to Cloudinary and return the secure_url."""
-    import hashlib, time, hmac
+    import hashlib
+    import time
 
     if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
         raise RuntimeError(
@@ -96,7 +91,7 @@ def upload_to_cloudinary(file_path: Path) -> str:
     ).hexdigest()
 
     url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/video/upload"
-    log.info("Uploading %s to Cloudinary …", file_path)
+    log.info("Uploading %s to Cloudinary ...", file_path)
 
     with open(file_path, "rb") as fh:
         resp = requests.post(
@@ -116,49 +111,44 @@ def upload_to_cloudinary(file_path: Path) -> str:
 
 
 def build_video(
-    image_paths: list[Path],
+    image_paths: list,
     audio_path: Path,
     output_path: Path,
     scene_duration: int = DEFAULT_SCENE_DURATION,
 ) -> Path:
     """
-    Assemble portrait video from images + audio using /root/.nix-profile/bin/ffmpeg.
-
-    Strategy
-    --------
-    1. Scale + pad every image to 1080×1920 (9:16) with a blurred copy as
-       background (no black bars).
+    Assemble portrait video from images + audio using FFmpeg.
+    1. Scale + pad every image to 1080x1920 (9:16) with blurred background.
     2. Concatenate image clips; loop / trim to match audio duration.
     3. Mux with voiceover audio.
     """
     workdir = output_path.parent
 
-    # ── Step 0: probe audio duration ────────────────────────────────────────
-   probe = subprocess.run(
-    [
-        "/root/.nix-profile/bin/ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(audio_path),
-    ],
-    capture_output=True, text=True,
-)
+    # ── Step 0: probe audio duration ──────────────────────────────────────────
+    probe = subprocess.run(
+        [
+            FFPROBE, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True, text=True,
+    )
     try:
         audio_duration = float(probe.stdout.strip())
     except ValueError:
         audio_duration = len(image_paths) * scene_duration
     log.info("Audio duration: %.2f s", audio_duration)
 
-    # ── Step 1: per-image clips ──────────────────────────────────────────────
-    clip_paths: list[Path] = []
+    # ── Step 1: per-image clips ────────────────────────────────────────────────
+    clip_paths = []
     for idx, img in enumerate(image_paths):
         clip = workdir / f"clip_{idx:03d}.mp4"
         run([
-            "/root/.nix-profile/bin/ffmpeg", "-y",
+            FFMPEG, "-y",
             "-loop", "1",
             "-i", str(img),
             "-vf", (
-                # blur background fill
                 "split[bg][fg];"
                 "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
                 "crop=1080:1920,boxblur=20:20[bgblur];"
@@ -171,27 +161,25 @@ def build_video(
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "fast",
-            clip,
+            str(clip),
         ])
         clip_paths.append(clip)
 
-    # ── Step 2: concat clips ─────────────────────────────────────────────────
+    # ── Step 2: concat clips ──────────────────────────────────────────────────
     concat_file = workdir / "concat.txt"
-    concat_file.write_text(
-        "\n".join(f"file '{p}'" for p in clip_paths)
-    )
+    concat_file.write_text("\n".join(f"file '{p}'" for p in clip_paths))
     raw_video = workdir / "raw_video.mp4"
     run([
-        "/root/.nix-profile/bin/ffmpeg", "-y",
+        FFMPEG, "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_file),
         "-c", "copy",
-        raw_video,
+        str(raw_video),
     ])
 
-    # ── Step 3: trim / loop video to audio length, mux audio ─────────────────
+    # ── Step 3: loop video to audio length, mux audio ─────────────────────────
     run([
-        "/root/.nix-profile/bin/ffmpeg", "-y",
+        FFMPEG, "-y",
         "-stream_loop", "-1", "-i", str(raw_video),
         "-i", str(audio_path),
         "-map", "0:v:0", "-map", "1:a:0",
@@ -212,35 +200,32 @@ def build_video(
 @app.route("/health", methods=["GET"])
 def health():
     """Liveness probe."""
-    # Check /root/.nix-profile/bin/ffmpeg is present
     try:
-        run(["/root/.nix-profile/bin/ffmpeg", "-version"])
-        /root/.nix-profile/bin/ffmpeg_ok = True
+        run([FFMPEG, "-version"])
+        ffmpeg_ok = True
     except Exception:
-        /root/.nix-profile/bin/ffmpeg_ok = False
-
-    return jsonify({"status": "ok", "/root/.nix-profile/bin/ffmpeg": /root/.nix-profile/bin/ffmpeg_ok}), 200
+        ffmpeg_ok = False
+    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
 
 
 @app.route("/build", methods=["POST"])
 def build():
-    check_auth()
     """
     Build a short-form video.
 
-    Expected JSON body
-    ------------------
+    Expected JSON body:
     {
-        "video_id":       "abc123",          // used for Cloudinary public_id
-        "audio_url":      "https://...",     // Cloudinary voiceover URL
-        "image_urls":     ["https://...", ...],  // 1-8 Pexels portrait URLs
-        "scene_duration": 5                  // optional, seconds per image
+        "video_id":       "abc123",
+        "audio_url":      "https://...",
+        "image_urls":     ["https://...", ...],
+        "scene_duration": 5
     }
 
-    Returns
-    -------
+    Returns:
     { "video_url": "https://res.cloudinary.com/..." }
     """
+    check_auth()
+
     # ── Parse body ────────────────────────────────────────────────────────────
     try:
         body = request.get_json(force=True, silent=True) or {}
@@ -248,10 +233,10 @@ def build():
     except Exception:
         body = {}
 
-    video_id      = body.get("video_id") or str(uuid.uuid4())
-    audio_url     = body.get("audio_url", "").strip()
-    image_urls    = body.get("image_urls") or []
-    scene_dur     = int(body.get("scene_duration", DEFAULT_SCENE_DURATION))
+    video_id   = body.get("video_id") or str(uuid.uuid4())
+    audio_url  = body.get("audio_url", "").strip()
+    image_urls = body.get("image_urls") or []
+    scene_dur  = int(body.get("scene_duration", DEFAULT_SCENE_DURATION))
 
     errors = []
     if not audio_url:
@@ -261,7 +246,7 @@ def build():
     if errors:
         return jsonify({"error": "; ".join(errors)}), 400
 
-    # ── Work in a temp directory ───────────────────────────────────────────────
+    # ── Work in a temp directory ──────────────────────────────────────────────
     with tempfile.TemporaryDirectory(prefix="vb_") as tmpdir:
         tmp = Path(tmpdir)
 
@@ -272,8 +257,8 @@ def build():
             download_file(audio_url, audio_path)
 
             # Download images
-            image_paths: list[Path] = []
-            for i, url in enumerate(image_urls[:8]):      # cap at 8
+            image_paths = []
+            for i, url in enumerate(image_urls[:8]):
                 ext = Path(url.split("?")[0]).suffix or ".jpg"
                 p   = tmp / f"img_{i:03d}{ext}"
                 download_file(url, p)
