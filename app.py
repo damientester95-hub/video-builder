@@ -1,174 +1,285 @@
-from flask import Flask, request, jsonify
-import requests
-import cloudinary
-import cloudinary.uploader
 import os
 import uuid
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import *
-from moviepy.video.fx.all import fadein, fadeout
+import requests
 import tempfile
-import urllib.request
+import subprocess
+import logging
+import traceback
+import json
+from pathlib import Path
+from flask import Flask, request, jsonify
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-cloudinary.config(
-    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.environ.get("CLOUDINARY_API_KEY"),
-    api_secret=os.environ.get("CLOUDINARY_API_SECRET")
-)
+# ── Config ───────────────────────────────────────────────────────────────────
+CLOUDINARY_UPLOAD_URL = os.environ.get("CLOUDINARY_UPLOAD_URL")   # e.g. https://api.cloudinary.com/v1_1/<cloud>/video/upload
+CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 
-SCENE_DURATION = 7
-FONT_SIZE = 60
-VIDEO_W = 720
-VIDEO_H = 1280
+# How long each photo scene lasts (seconds).  Override via request body.
+DEFAULT_SCENE_DURATION = 5
 
-def download_file(url, suffix):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    urllib.request.urlretrieve(url, tmp.name)
-    return tmp.name
 
-def make_text_clip(text, duration, fontsize=FONT_SIZE, position=("center", "center")):
-    return (TextClip(
-        text,
-        fontsize=fontsize,
-        color="white",
-        stroke_color="black",
-        stroke_width=3,
-        font="Montserrat-Bold",
-        method="caption",
-        size=(VIDEO_W - 80, None),
-        align="center"
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def run(cmd: list[str], cwd=None) -> subprocess.CompletedProcess:
+    """Run a shell command, log it, raise on non-zero exit."""
+    log.info("RUN: %s", " ".join(cmd))
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, cwd=cwd
     )
-    .set_duration(duration)
-    .set_position(position)
-    .fadein(0.3)
-    .fadeout(0.3))
+    if result.stdout:
+        log.info("STDOUT: %s", result.stdout[-2000:])
+    if result.stderr:
+        log.info("STDERR: %s", result.stderr[-2000:])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed (exit {result.returncode}):\n"
+            f"CMD : {' '.join(cmd)}\n"
+            f"STDERR: {result.stderr[-1000:]}"
+        )
+    return result
 
-def make_image_clip(image_url, duration):
-    path = download_file(image_url, ".jpg")
-    img = Image.open(path).convert("RGB")
-    
-    # Crop to 9:16
-    img_w, img_h = img.size
-    target_ratio = VIDEO_W / VIDEO_H
-    if img_w / img_h > target_ratio:
-        new_w = int(img_h * target_ratio)
-        left = (img_w - new_w) // 2
-        img = img.crop((left, 0, left + new_w, img_h))
-    else:
-        new_h = int(img_w / target_ratio)
-        top = (img_h - new_h) // 2
-        img = img.crop((0, top, img_w, top + new_h))
-    
-    img = img.resize((VIDEO_W, VIDEO_H), Image.LANCZOS)
-    img.save(path)
-    
-    clip = ImageClip(path).set_duration(duration)
-    
-    # Ken Burns zoom effect
-    def zoom(t):
-        scale = 1 + 0.04 * (t / duration)
-        new_w = int(VIDEO_W * scale)
-        new_h = int(VIDEO_H * scale)
-        x = (new_w - VIDEO_W) // 2
-        y = (new_h - VIDEO_H) // 2
-        return clip.resize((new_w, new_h)).crop(x1=x, y1=y, x2=x+VIDEO_W, y2=y+VIDEO_H).get_frame(t)
-    
-    return VideoClip(zoom, duration=duration).set_fps(30)
 
-@app.route("/build", methods=["POST"])
-def build_video():
-    data = request.json
-    
-    title = data.get("title", "")
-    hook = data.get("hook", "")
-    captions = data.get("captions", "")
-    voiceover_url = data.get("voiceover_url", "")
-    images = data.get("images", [])
-    video_id = data.get("video_id", str(uuid.uuid4()))
+def download_file(url: str, dest: Path) -> Path:
+    """Stream-download a URL to dest path."""
+    log.info("Downloading %s → %s", url, dest)
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk)
+    log.info("Downloaded %s bytes", dest.stat().st_size)
+    return dest
 
-    if len(images) < 4:
-        return jsonify({"error": "Need 4 image URLs"}), 400
 
+def upload_to_cloudinary(file_path: Path) -> str:
+    """Upload a file to Cloudinary and return the secure_url."""
+    import hashlib, time, hmac
+
+    if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
+        raise RuntimeError(
+            "Cloudinary env vars missing: CLOUDINARY_CLOUD_NAME, "
+            "CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET"
+        )
+
+    timestamp = str(int(time.time()))
+    params_to_sign = f"timestamp={timestamp}"
+    signature = hashlib.sha1(
+        (params_to_sign + CLOUDINARY_API_SECRET).encode()
+    ).hexdigest()
+
+    url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/video/upload"
+    log.info("Uploading %s to Cloudinary …", file_path)
+
+    with open(file_path, "rb") as fh:
+        resp = requests.post(
+            url,
+            data={
+                "api_key": CLOUDINARY_API_KEY,
+                "timestamp": timestamp,
+                "signature": signature,
+            },
+            files={"file": fh},
+            timeout=300,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    log.info("Cloudinary response: %s", json.dumps(data)[:500])
+    return data["secure_url"]
+
+
+def build_video(
+    image_paths: list[Path],
+    audio_path: Path,
+    output_path: Path,
+    scene_duration: int = DEFAULT_SCENE_DURATION,
+) -> Path:
+    """
+    Assemble portrait video from images + audio using FFmpeg.
+
+    Strategy
+    --------
+    1. Scale + pad every image to 1080×1920 (9:16) with a blurred copy as
+       background (no black bars).
+    2. Concatenate image clips; loop / trim to match audio duration.
+    3. Mux with voiceover audio.
+    """
+    workdir = output_path.parent
+
+    # ── Step 0: probe audio duration ────────────────────────────────────────
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        capture_output=True, text=True,
+    )
     try:
-        # Build each scene
-        scenes = []
+        audio_duration = float(probe.stdout.strip())
+    except ValueError:
+        audio_duration = len(image_paths) * scene_duration
+    log.info("Audio duration: %.2f s", audio_duration)
 
-        # Scene 1 - Title
-        img1 = make_image_clip(images[0], SCENE_DURATION)
-        txt1 = make_text_clip(title, SCENE_DURATION, fontsize=65, position=("center", "center"))
-        scene1 = CompositeVideoClip([img1, txt1], size=(VIDEO_W, VIDEO_H))
-        scenes.append(scene1)
+    # ── Step 1: per-image clips ──────────────────────────────────────────────
+    clip_paths: list[Path] = []
+    for idx, img in enumerate(image_paths):
+        clip = workdir / f"clip_{idx:03d}.mp4"
+        run([
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(img),
+            "-vf", (
+                # blur background fill
+                "split[bg][fg];"
+                "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,boxblur=20:20[bgblur];"
+                "[fg]scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0[fgscaled];"
+                "[bgblur][fgscaled]overlay"
+            ),
+            "-t", str(scene_duration),
+            "-r", "30",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "fast",
+            clip,
+        ])
+        clip_paths.append(clip)
 
-        # Scene 2 - Hook
-        img2 = make_image_clip(images[1], SCENE_DURATION)
-        txt2 = make_text_clip(hook, SCENE_DURATION, fontsize=58, position=("center", "center"))
-        scene2 = CompositeVideoClip([img2, txt2], size=(VIDEO_W, VIDEO_H))
-        scenes.append(scene2)
+    # ── Step 2: concat clips ─────────────────────────────────────────────────
+    concat_file = workdir / "concat.txt"
+    concat_file.write_text(
+        "\n".join(f"file '{p}'" for p in clip_paths)
+    )
+    raw_video = workdir / "raw_video.mp4"
+    run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_file),
+        "-c", "copy",
+        raw_video,
+    ])
 
-        # Scene 3 - Captions
-        img3 = make_image_clip(images[2], SCENE_DURATION)
-        txt3 = make_text_clip(captions, SCENE_DURATION, fontsize=52, position=("center", 0.75))
-        scene3 = CompositeVideoClip([img3, txt3], size=(VIDEO_W, VIDEO_H))
-        scenes.append(scene3)
+    # ── Step 3: trim / loop video to audio length, mux audio ─────────────────
+    run([
+        "ffmpeg", "-y",
+        "-stream_loop", "-1", "-i", str(raw_video),
+        "-i", str(audio_path),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-shortest",
+        "-c:v", "libx264",
+        "-c:a", "aac", "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output_path),
+    ])
 
-        # Scene 4 - Voiceover continues
-        img4 = make_image_clip(images[3], SCENE_DURATION)
-        scene4 = CompositeVideoClip([img4], size=(VIDEO_W, VIDEO_H))
-        scenes.append(scene4)
+    log.info("Video built: %s (%.1f MB)", output_path, output_path.stat().st_size / 1e6)
+    return output_path
 
-        # Concatenate with crossfade
-        final_video = concatenate_videoclips(scenes, method="compose")
 
-        # Add voiceover audio
-        if voiceover_url:
-            audio_path = download_file(voiceover_url, ".mp3")
-            audio = AudioFileClip(audio_path)
-            # Loop or trim audio to match video length
-            if audio.duration < final_video.duration:
-                audio = audio.fx(afx.audio_loop, duration=final_video.duration)
-            else:
-                audio = audio.subclip(0, final_video.duration)
-            final_video = final_video.set_audio(audio)
-
-        # Export
-        output_path = f"/tmp/{video_id}.mp4"
-        final_video.write_videofile(
-            output_path,
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            temp_audiofile=f"/tmp/{video_id}_temp.m4a",
-            remove_temp=True,
-            logger=None
-        )
-
-        # Upload to Cloudinary
-        result = cloudinary.uploader.upload(
-            output_path,
-            resource_type="video",
-            public_id=f"videos/{video_id}",
-            overwrite=True
-        )
-
-        return jsonify({
-            "success": True,
-            "video_url": result["secure_url"],
-            "video_id": video_id
-        })
-
-    except Exception as e:
-        import traceback
-        error_detail = traceback.format_exc()
-        print(f"ERROR: {error_detail}")
-        return jsonify({"error": str(e), "detail": error_detail}), 500
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    """Liveness probe."""
+    # Check FFmpeg is present
+    try:
+        run(["ffmpeg", "-version"])
+        ffmpeg_ok = True
+    except Exception:
+        ffmpeg_ok = False
+
+    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
+
+
+@app.route("/build", methods=["POST"])
+def build():
+    """
+    Build a short-form video.
+
+    Expected JSON body
+    ------------------
+    {
+        "video_id":       "abc123",          // used for Cloudinary public_id
+        "audio_url":      "https://...",     // Cloudinary voiceover URL
+        "image_urls":     ["https://...", ...],  // 1-8 Pexels portrait URLs
+        "scene_duration": 5                  // optional, seconds per image
+    }
+
+    Returns
+    -------
+    { "video_url": "https://res.cloudinary.com/..." }
+    """
+    # ── Parse body ────────────────────────────────────────────────────────────
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        log.info("Received /build payload: %s", json.dumps(body)[:500])
+    except Exception:
+        body = {}
+
+    video_id      = body.get("video_id") or str(uuid.uuid4())
+    audio_url     = body.get("audio_url", "").strip()
+    image_urls    = body.get("image_urls") or []
+    scene_dur     = int(body.get("scene_duration", DEFAULT_SCENE_DURATION))
+
+    errors = []
+    if not audio_url:
+        errors.append("'audio_url' is required")
+    if not image_urls:
+        errors.append("'image_urls' must be a non-empty list")
+    if errors:
+        return jsonify({"error": "; ".join(errors)}), 400
+
+    # ── Work in a temp directory ───────────────────────────────────────────────
+    with tempfile.TemporaryDirectory(prefix="vb_") as tmpdir:
+        tmp = Path(tmpdir)
+
+        try:
+            # Download audio
+            audio_ext  = Path(audio_url.split("?")[0]).suffix or ".mp3"
+            audio_path = tmp / f"audio{audio_ext}"
+            download_file(audio_url, audio_path)
+
+            # Download images
+            image_paths: list[Path] = []
+            for i, url in enumerate(image_urls[:8]):      # cap at 8
+                ext = Path(url.split("?")[0]).suffix or ".jpg"
+                p   = tmp / f"img_{i:03d}{ext}"
+                download_file(url, p)
+                image_paths.append(p)
+
+            if not image_paths:
+                return jsonify({"error": "No images could be downloaded"}), 500
+
+            # Build video
+            output_path = tmp / f"{video_id}.mp4"
+            build_video(image_paths, audio_path, output_path, scene_dur)
+
+            # Upload to Cloudinary
+            video_url = upload_to_cloudinary(output_path)
+
+            return jsonify({"video_url": video_url, "video_id": video_id}), 200
+
+        except Exception as exc:
+            tb = traceback.format_exc()
+            log.error("Build failed for video_id=%s:\n%s", video_id, tb)
+            return jsonify({"error": str(exc), "traceback": tb[-2000:]}), 500
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
