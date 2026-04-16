@@ -122,7 +122,7 @@ def build_video(
     scene_duration: int = DEFAULT_SCENE_DURATION,
 ) -> Path:
     """
-    Assemble portrait video from images + audio using FFmpeg.
+    Assemble portrait video from images + audio using /root/.nix-profile/bin/ffmpeg.
 
     Strategy
     --------
@@ -134,15 +134,15 @@ def build_video(
     workdir = output_path.parent
 
     # ── Step 0: probe audio duration ────────────────────────────────────────
-    probe = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(audio_path),
-        ],
-        capture_output=True, text=True,
-    )
+   probe = subprocess.run(
+    [
+        "/root/.nix-profile/bin/ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ],
+    capture_output=True, text=True,
+)
     try:
         audio_duration = float(probe.stdout.strip())
     except ValueError:
@@ -154,7 +154,7 @@ def build_video(
     for idx, img in enumerate(image_paths):
         clip = workdir / f"clip_{idx:03d}.mp4"
         run([
-            "ffmpeg", "-y",
+            "/root/.nix-profile/bin/ffmpeg", "-y",
             "-loop", "1",
             "-i", str(img),
             "-vf", (
@@ -182,7 +182,7 @@ def build_video(
     )
     raw_video = workdir / "raw_video.mp4"
     run([
-        "ffmpeg", "-y",
+        "/root/.nix-profile/bin/ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_file),
         "-c", "copy",
@@ -191,7 +191,7 @@ def build_video(
 
     # ── Step 3: trim / loop video to audio length, mux audio ─────────────────
     run([
-        "ffmpeg", "-y",
+        "/root/.nix-profile/bin/ffmpeg", "-y",
         "-stream_loop", "-1", "-i", str(raw_video),
         "-i", str(audio_path),
         "-map", "0:v:0", "-map", "1:a:0",
@@ -212,14 +212,14 @@ def build_video(
 @app.route("/health", methods=["GET"])
 def health():
     """Liveness probe."""
-    # Check FFmpeg is present
+    # Check /root/.nix-profile/bin/ffmpeg is present
     try:
-        run(["ffmpeg", "-version"])
-        ffmpeg_ok = True
+        run(["/root/.nix-profile/bin/ffmpeg", "-version"])
+        /root/.nix-profile/bin/ffmpeg_ok = True
     except Exception:
-        ffmpeg_ok = False
+        /root/.nix-profile/bin/ffmpeg_ok = False
 
-    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
+    return jsonify({"status": "ok", "/root/.nix-profile/bin/ffmpeg": /root/.nix-profile/bin/ffmpeg_ok}), 200
 
 
 @app.route("/build", methods=["POST"])
