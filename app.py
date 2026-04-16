@@ -9,6 +9,26 @@ import json
 from pathlib import Path
 from flask import Flask, request, jsonify
 
+
+# ── Auth ──────────────────────────────────────────────────────────────────
+check_auth()
+
+AUTH_TOKEN = os.environ.get("API_SECRET_TOKEN")
+
+def check_auth():
+
+    if not AUTH_TOKEN:
+
+        return  # no auth configured, allow all
+
+    token = request.headers.get("X-Api-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
+
+    if token != AUTH_TOKEN:
+
+        from flask import abort
+
+        abort(403)
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
