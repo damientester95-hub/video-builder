@@ -118,7 +118,7 @@ def build_video(
 ) -> Path:
     """
     Assemble portrait video from images + audio using FFmpeg.
-    1. Scale + pad every image to 1080x1920 (9:16) with blurred background.
+    1. Scale + crop every image to 1080x1920 (9:16).
     2. Concatenate image clips; loop / trim to match audio duration.
     3. Mux with voiceover audio.
     """
@@ -148,19 +148,13 @@ def build_video(
             FFMPEG, "-y",
             "-loop", "1",
             "-i", str(img),
-            "-vf", (
-                "split[bg][fg];"
-                "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920,boxblur=20:20[bgblur];"
-                "[fg]scale=1080:1920:force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0[fgscaled];"
-                "[bgblur][fgscaled]overlay"
-            ),
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
             "-t", str(scene_duration),
-            "-r", "30",
+            "-r", "24",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-preset", "fast",
+            "-preset", "ultrafast",
+            "-crf", "28",
             str(clip),
         ])
         clip_paths.append(clip)
@@ -197,26 +191,16 @@ def build_video(
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-#@app.route("/health", methods=["GET"])
-#def health():
-#    """Liveness probe."""
-#    try:
-#        run([FFMPEG, "-version"])
-#        ffmpeg_ok = True
-#    except Exception:
-#        ffmpeg_ok = False
-#    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
 @app.route("/health", methods=["GET"])
 def health():
-    import shutil
-    ffmpeg_path = shutil.which("ffmpeg")
-    ffprobe_path = shutil.which("ffprobe")
-    return jsonify({
-        "status": "ok",
-        "ffmpeg_path": ffmpeg_path,
-        "ffprobe_path": ffprobe_path,
-    }), 200
-    
+    """Liveness probe."""
+    try:
+        run([FFMPEG, "-version"])
+        ffmpeg_ok = True
+    except Exception:
+        ffmpeg_ok = False
+    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
+
 @app.route("/debug", methods=["GET"])
 def debug():
     checks = {}
