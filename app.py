@@ -38,8 +38,8 @@ CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 
 DEFAULT_SCENE_DURATION = 5
 
-FFMPEG  = "ffmpeg"
-FFPROBE = "ffprobe"
+FFMPEG  = "/usr/bin/ffmpeg"
+FFPROBE = "/usr/bin/ffprobe"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
