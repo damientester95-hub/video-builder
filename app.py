@@ -36,7 +36,7 @@ CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 
-DEFAULT_SCENE_DURATION = 5
+DEFAULT_SCENE_DURATION = 3   # seconds per image
 
 FFMPEG  = "/usr/bin/ffmpeg"
 FFPROBE = "/usr/bin/ffprobe"
@@ -118,9 +118,7 @@ def build_video(
 ) -> Path:
     """
     Assemble portrait video from images + audio using FFmpeg.
-    1. Scale + crop every image to 1080x1920 (9:16).
-    2. Concatenate image clips; loop / trim to match audio duration.
-    3. Mux with voiceover audio.
+    720x1280 (9:16) to stay within Railway RAM limits.
     """
     workdir = output_path.parent
 
@@ -140,7 +138,7 @@ def build_video(
         audio_duration = len(image_paths) * scene_duration
     log.info("Audio duration: %.2f s", audio_duration)
 
-    # ── Step 1: per-image clips ────────────────────────────────────────────────
+    # ── Step 1: per-image clips at 720x1280 ───────────────────────────────────
     clip_paths = []
     for idx, img in enumerate(image_paths):
         clip = workdir / f"clip_{idx:03d}.mp4"
@@ -148,13 +146,13 @@ def build_video(
             FFMPEG, "-y",
             "-loop", "1",
             "-i", str(img),
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+            "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
             "-t", str(scene_duration),
             "-r", "24",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "ultrafast",
-            "-crf", "28",
+            "-crf", "30",
             str(clip),
         ])
         clip_paths.append(clip)
@@ -179,7 +177,7 @@ def build_video(
         "-map", "0:v:0", "-map", "1:a:0",
         "-shortest",
         "-c:v", "libx264",
-        "-c:a", "aac", "-b:a", "192k",
+        "-c:a", "aac", "-b:a", "128k",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(output_path),
@@ -232,7 +230,7 @@ def build():
         "video_id":       "abc123",
         "audio_url":      "https://...",
         "image_urls":     ["https://...", ...],
-        "scene_duration": 5
+        "scene_duration": 3
     }
 
     Returns:
@@ -240,7 +238,6 @@ def build():
     """
     check_auth()
 
-    # ── Parse body ────────────────────────────────────────────────────────────
     try:
         body = request.get_json(force=True, silent=True) or {}
         log.info("Received /build payload: %s", json.dumps(body)[:500])
@@ -260,7 +257,6 @@ def build():
     if errors:
         return jsonify({"error": "; ".join(errors)}), 400
 
-    # ── Work in a temp directory ──────────────────────────────────────────────
     with tempfile.TemporaryDirectory(prefix="vb_") as tmpdir:
         tmp = Path(tmpdir)
 
