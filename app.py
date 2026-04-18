@@ -36,7 +36,7 @@ CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 
-DEFAULT_SCENE_DURATION = 3   # seconds per image
+DEFAULT_SCENE_DURATION = 5   # seconds per image
 
 FFMPEG  = "/usr/bin/ffmpeg"
 FFPROBE = "/usr/bin/ffprobe"
@@ -59,6 +59,23 @@ def run(cmd: list, cwd=None) -> subprocess.CompletedProcess:
             f"STDERR: {result.stderr[-1000:]}"
         )
     return result
+
+
+def get_duration(path: Path) -> float:
+    """Return duration of a media file in seconds."""
+    result = subprocess.run(
+        [
+            FFPROBE, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
 
 
 def download_file(url: str, dest: Path) -> Path:
@@ -118,27 +135,24 @@ def build_video(
 ) -> Path:
     """
     Assemble portrait video from images + audio using FFmpeg.
-    720x1280 (9:16) to stay within Railway RAM limits.
+    - Each image gets scene_duration seconds
+    - Total video length matches audio (trimmed or padded with last image)
+    - 720x1280 (9:16) portrait format
     """
     workdir = output_path.parent
 
-    # ── Step 0: probe audio duration ──────────────────────────────────────────
-    probe = subprocess.run(
-        [
-            FFPROBE, "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(audio_path),
-        ],
-        capture_output=True, text=True,
-    )
-    try:
-        audio_duration = float(probe.stdout.strip())
-    except ValueError:
+    # ── Step 0: get audio duration ─────────────────────────────────────────────
+    audio_duration = get_duration(audio_path)
+    if audio_duration == 0.0:
         audio_duration = len(image_paths) * scene_duration
     log.info("Audio duration: %.2f s", audio_duration)
 
-    # ── Step 1: per-image clips at 720x1280 ───────────────────────────────────
+    # Work out how long each image should show so total = audio duration
+    n = len(image_paths)
+    per_image = audio_duration / n
+    log.info("Per image: %.2f s over %d images", per_image, n)
+
+    # ── Step 1: one clip per image, exact duration ─────────────────────────────
     clip_paths = []
     for idx, img in enumerate(image_paths):
         clip = workdir / f"clip_{idx:03d}.mp4"
@@ -147,38 +161,40 @@ def build_video(
             "-loop", "1",
             "-i", str(img),
             "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
-            "-t", str(scene_duration),
+            "-t", f"{per_image:.3f}",
             "-r", "24",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "ultrafast",
             "-crf", "30",
+            "-tune", "stillimage",
             str(clip),
         ])
         clip_paths.append(clip)
 
-    # ── Step 2: concat clips ──────────────────────────────────────────────────
+    # ── Step 2: concat all clips ───────────────────────────────────────────────
     concat_file = workdir / "concat.txt"
     concat_file.write_text("\n".join(f"file '{p}'" for p in clip_paths))
-    raw_video = workdir / "raw_video.mp4"
+    silent_video = workdir / "silent.mp4"
     run([
         FFMPEG, "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_file),
         "-c", "copy",
-        str(raw_video),
+        str(silent_video),
     ])
 
-    # ── Step 3: loop video to audio length, mux audio ─────────────────────────
+    # ── Step 3: mux audio — copy video stream, no re-encode ───────────────────
     run([
         FFMPEG, "-y",
-        "-stream_loop", "-1", "-i", str(raw_video),
+        "-i", str(silent_video),
         "-i", str(audio_path),
-        "-map", "0:v:0", "-map", "1:a:0",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",          # NO re-encode — just copy the video stream
+        "-c:a", "aac",
+        "-b:a", "128k",
         "-shortest",
-        "-c:v", "libx264",
-        "-c:a", "aac", "-b:a", "128k",
-        "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(output_path),
     ])
@@ -199,7 +215,6 @@ def health():
         ffmpeg_ok = False
     return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
 
-@app.route("/debug", methods=["GET"])
 def debug():
     checks = {}
     for path in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]:
@@ -230,7 +245,7 @@ def build():
         "video_id":       "abc123",
         "audio_url":      "https://...",
         "image_urls":     ["https://...", ...],
-        "scene_duration": 3
+        "scene_duration": 5
     }
 
     Returns:
@@ -297,3 +312,4 @@ def build():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+@app.route("/debug", methods=["GET"])
