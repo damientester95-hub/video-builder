@@ -197,15 +197,25 @@ def build_video(
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+#@app.route("/health", methods=["GET"])
+#def health():
+#    """Liveness probe."""
+#    try:
+#        run([FFMPEG, "-version"])
+#        ffmpeg_ok = True
+#    except Exception:
+#        ffmpeg_ok = False
+#    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
 @app.route("/health", methods=["GET"])
 def health():
-    """Liveness probe."""
-    try:
-        run([FFMPEG, "-version"])
-        ffmpeg_ok = True
-    except Exception:
-        ffmpeg_ok = False
-    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
+    import shutil
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    return jsonify({
+        "status": "ok",
+        "ffmpeg_path": ffmpeg_path,
+        "ffprobe_path": ffprobe_path,
+    }), 200
 
 
 @app.route("/build", methods=["POST"])
