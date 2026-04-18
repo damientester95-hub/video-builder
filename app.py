@@ -219,18 +219,22 @@ def health():
     
 @app.route("/debug", methods=["GET"])
 def debug():
-    import glob
+    checks = {}
+    for path in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]:
+        checks[path] = os.path.exists(path)
+    
     result = subprocess.run(
-        ["find", "/", "-name", "ffmpeg", "-type", "f"],
-        capture_output=True, text=True, timeout=10
-    )
-    nix_ls = subprocess.run(
-        ["ls", "/nix/store"],
+        ["which", "ffmpeg"],
         capture_output=True, text=True
     )
+    which_result = subprocess.run(
+        ["ls", "/usr/bin/ff*"],
+        capture_output=True, text=True,
+        shell=False
+    )
     return jsonify({
-        "ffmpeg_find": result.stdout,
-        "nix_store_sample": nix_ls.stdout[:2000],
+        "path_checks": checks,
+        "which_ffmpeg": result.stdout.strip(),
         "PATH": os.environ.get("PATH")
     }), 200
 
