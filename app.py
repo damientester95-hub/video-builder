@@ -15,7 +15,7 @@ AUTH_TOKEN = os.environ.get("API_SECRET_TOKEN")
 
 def check_auth():
     if not AUTH_TOKEN:
-        return  # no auth configured, allow all
+        return
     token = request.headers.get("X-Api-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     if token != AUTH_TOKEN:
         from flask import abort
@@ -36,16 +36,16 @@ CLOUDINARY_API_KEY    = os.environ.get("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 
-DEFAULT_SCENE_DURATION = 5   # seconds per image
-
 FFMPEG  = "/usr/bin/ffmpeg"
 FFPROBE = "/usr/bin/ffprobe"
+
+# Hard cap: never encode more than 60s of video total
+MAX_VIDEO_SECONDS = 60
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def run(cmd: list, cwd=None) -> subprocess.CompletedProcess:
-    """Run a shell command, log it, raise on non-zero exit."""
     log.info("RUN: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.stdout:
@@ -61,25 +61,7 @@ def run(cmd: list, cwd=None) -> subprocess.CompletedProcess:
     return result
 
 
-def get_duration(path: Path) -> float:
-    """Return duration of a media file in seconds."""
-    result = subprocess.run(
-        [
-            FFPROBE, "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        capture_output=True, text=True,
-    )
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return 0.0
-
-
 def download_file(url: str, dest: Path) -> Path:
-    """Stream-download a URL to dest path."""
     log.info("Downloading %s -> %s", url, dest)
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -91,33 +73,19 @@ def download_file(url: str, dest: Path) -> Path:
 
 
 def upload_to_cloudinary(file_path: Path) -> str:
-    """Upload a file to Cloudinary and return the secure_url."""
-    import hashlib
-    import time
-
+    import hashlib, time
     if not all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
-        raise RuntimeError(
-            "Cloudinary env vars missing: CLOUDINARY_CLOUD_NAME, "
-            "CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET"
-        )
-
+        raise RuntimeError("Cloudinary env vars missing")
     timestamp = str(int(time.time()))
-    params_to_sign = f"timestamp={timestamp}"
     signature = hashlib.sha1(
-        (params_to_sign + CLOUDINARY_API_SECRET).encode()
+        (f"timestamp={timestamp}" + CLOUDINARY_API_SECRET).encode()
     ).hexdigest()
-
     url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/video/upload"
     log.info("Uploading %s to Cloudinary ...", file_path)
-
     with open(file_path, "rb") as fh:
         resp = requests.post(
             url,
-            data={
-                "api_key": CLOUDINARY_API_KEY,
-                "timestamp": timestamp,
-                "signature": signature,
-            },
+            data={"api_key": CLOUDINARY_API_KEY, "timestamp": timestamp, "signature": signature},
             files={"file": fh},
             timeout=300,
         )
@@ -131,28 +99,24 @@ def build_video(
     image_paths: list,
     audio_path: Path,
     output_path: Path,
-    scene_duration: int = DEFAULT_SCENE_DURATION,
+    scene_duration: int = 5,
 ) -> Path:
     """
-    Assemble portrait video from images + audio using FFmpeg.
-    - Each image gets scene_duration seconds
-    - Total video length matches audio (trimmed or padded with last image)
-    - 720x1280 (9:16) portrait format
+    Build a portrait video.
+    - Each image shows for exactly scene_duration seconds
+    - Total video = scene_duration * num_images (hard capped at MAX_VIDEO_SECONDS)
+    - Audio is trimmed to match video length
+    - 720x1280 portrait, ultrafast encoding
     """
     workdir = output_path.parent
-
-    # ── Step 0: get audio duration ─────────────────────────────────────────────
-    audio_duration = get_duration(audio_path)
-    if audio_duration == 0.0:
-        audio_duration = len(image_paths) * scene_duration
-    log.info("Audio duration: %.2f s", audio_duration)
-
-    # Work out how long each image should show so total = audio duration
     n = len(image_paths)
-    per_image = audio_duration / n
-    log.info("Per image: %.2f s over %d images", per_image, n)
 
-    # ── Step 1: one clip per image, exact duration ─────────────────────────────
+    # Cap total duration to avoid OOM / timeout
+    per_image = min(scene_duration, MAX_VIDEO_SECONDS // n)
+    total = per_image * n
+    log.info("Building video: %d images x %ds = %ds total", n, per_image, total)
+
+    # ── Step 1: one clip per image ─────────────────────────────────────────────
     clip_paths = []
     for idx, img in enumerate(image_paths):
         clip = workdir / f"clip_{idx:03d}.mp4"
@@ -161,7 +125,7 @@ def build_video(
             "-loop", "1",
             "-i", str(img),
             "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
-            "-t", f"{per_image:.3f}",
+            "-t", str(per_image),
             "-r", "24",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
@@ -172,7 +136,7 @@ def build_video(
         ])
         clip_paths.append(clip)
 
-    # ── Step 2: concat all clips ───────────────────────────────────────────────
+    # ── Step 2: concat clips ───────────────────────────────────────────────────
     concat_file = workdir / "concat.txt"
     concat_file.write_text("\n".join(f"file '{p}'" for p in clip_paths))
     silent_video = workdir / "silent.mp4"
@@ -184,17 +148,17 @@ def build_video(
         str(silent_video),
     ])
 
-    # ── Step 3: mux audio — copy video stream, no re-encode ───────────────────
+    # ── Step 3: mux audio, trim both to total duration ─────────────────────────
     run([
         FFMPEG, "-y",
         "-i", str(silent_video),
         "-i", str(audio_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
-        "-c:v", "copy",          # NO re-encode — just copy the video stream
+        "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-shortest",
+        "-t", str(total),
         "-movflags", "+faststart",
         str(output_path),
     ])
@@ -207,31 +171,16 @@ def build_video(
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Liveness probe."""
     try:
         run([FFMPEG, "-version"])
         ffmpeg_ok = True
     except Exception:
         ffmpeg_ok = False
-    return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
+    return {"status": "ok", "ffmpeg": ffmpeg_ok}, 200
 
 
 @app.route("/build", methods=["POST"])
 def build():
-    """
-    Build a short-form video.
-
-    Expected JSON body:
-    {
-        "video_id":       "abc123",
-        "audio_url":      "https://...",
-        "image_urls":     ["https://...", ...],
-        "scene_duration": 5
-    }
-
-    Returns:
-    { "video_url": "https://res.cloudinary.com/..." }
-    """
     check_auth()
 
     try:
@@ -243,7 +192,7 @@ def build():
     video_id   = body.get("video_id") or str(uuid.uuid4())
     audio_url  = body.get("audio_url", "").strip()
     image_urls = body.get("image_urls") or []
-    scene_dur  = int(body.get("scene_duration", DEFAULT_SCENE_DURATION))
+    scene_dur  = int(body.get("scene_duration", 5))
 
     errors = []
     if not audio_url:
@@ -251,18 +200,15 @@ def build():
     if not image_urls:
         errors.append("'image_urls' must be a non-empty list")
     if errors:
-        return jsonify({"error": "; ".join(errors)}), 400
+        return {"error": "; ".join(errors)}, 400
 
     with tempfile.TemporaryDirectory(prefix="vb_") as tmpdir:
         tmp = Path(tmpdir)
-
         try:
-            # Download audio
             audio_ext  = Path(audio_url.split("?")[0]).suffix or ".mp3"
             audio_path = tmp / f"audio{audio_ext}"
             download_file(audio_url, audio_path)
 
-            # Download images
             image_paths = []
             for i, url in enumerate(image_urls[:8]):
                 ext = Path(url.split("?")[0]).suffix or ".jpg"
@@ -271,25 +217,21 @@ def build():
                 image_paths.append(p)
 
             if not image_paths:
-                return jsonify({"error": "No images could be downloaded"}), 500
+                return {"error": "No images could be downloaded"}, 500
 
-            # Build video
             output_path = tmp / f"{video_id}.mp4"
             build_video(image_paths, audio_path, output_path, scene_dur)
 
-            # Upload to Cloudinary
             video_url = upload_to_cloudinary(output_path)
-
-            return jsonify({"video_url": video_url, "video_id": video_id}), 200
+            return {"video_url": video_url, "video_id": video_id}, 200
 
         except Exception as exc:
             tb = traceback.format_exc()
             log.error("Build failed for video_id=%s:\n%s", video_id, tb)
-            return jsonify({"error": str(exc), "traceback": tb[-2000:]}), 500
+            return {"error": str(exc), "traceback": tb[-2000:]}, 500
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
