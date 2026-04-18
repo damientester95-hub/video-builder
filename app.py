@@ -38,8 +38,8 @@ CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 
 DEFAULT_SCENE_DURATION = 5
 
-FFMPEG  = "/root/.nix-profile/bin/ffmpeg"
-FFPROBE = "/root/.nix-profile/bin/ffprobe"
+FFMPEG  = "ffmpeg"
+FFPROBE = "ffprobe"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
