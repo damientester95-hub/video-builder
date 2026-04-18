@@ -215,25 +215,6 @@ def health():
         ffmpeg_ok = False
     return jsonify({"status": "ok", "ffmpeg": ffmpeg_ok}), 200
 
-def debug():
-    checks = {}
-    for path in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]:
-        checks[path] = os.path.exists(path)
-    
-    result = subprocess.run(
-        ["which", "ffmpeg"],
-        capture_output=True, text=True
-    )
-    which_result = subprocess.run(
-        ["ls", "/usr/bin/ff*"],
-        capture_output=True, text=True,
-        shell=False
-    )
-    return jsonify({
-        "path_checks": checks,
-        "which_ffmpeg": result.stdout.strip(),
-        "PATH": os.environ.get("PATH")
-    }), 200
 
 @app.route("/build", methods=["POST"])
 def build():
@@ -312,4 +293,3 @@ def build():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
-@app.route("/debug", methods=["GET"])
