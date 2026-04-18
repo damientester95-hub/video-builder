@@ -216,7 +216,23 @@ def health():
         "ffmpeg_path": ffmpeg_path,
         "ffprobe_path": ffprobe_path,
     }), 200
-
+    
+@app.route("/debug", methods=["GET"])
+def debug():
+    import glob
+    result = subprocess.run(
+        ["find", "/", "-name", "ffmpeg", "-type", "f"],
+        capture_output=True, text=True, timeout=10
+    )
+    nix_ls = subprocess.run(
+        ["ls", "/nix/store"],
+        capture_output=True, text=True
+    )
+    return jsonify({
+        "ffmpeg_find": result.stdout,
+        "nix_store_sample": nix_ls.stdout[:2000],
+        "PATH": os.environ.get("PATH")
+    }), 200
 
 @app.route("/build", methods=["POST"])
 def build():
